@@ -8,7 +8,11 @@ from openai import OpenAI
 # ===========================
 # CONFIG
 # ===========================
+<<<<<<< HEAD
 client = OpenAI()
+=======
+client = OpenAI(api_key="key")
+>>>>>>> 721c0ca (Fonctionne pas trop mal sur la détection des zones et des noms.)
 # Dossiers
 OUTPUT_JSON_DIR = "../data/output/matches_json"
 OUTPUT_CSV_DIR = "../data/output/matches_csv"
