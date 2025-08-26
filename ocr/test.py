@@ -2,6 +2,32 @@ import cv2
 import pytesseract
 import pandas as pd
 import numpy as np
+import re
+
+
+def fix_fraction(text):
+    # Détecte uniquement les fractions 0-99 / 0-99
+    matches = re.findall(r"\b([0-9]|[1-9][0-9]?)/([0-9]|[1-9][0-9]?)\b", text)
+    if matches:
+        # Retourne la première fraction trouvée, format "num/den"
+        return f"{matches[0][0]}/{matches[0][1]}"
+    return text
+
+
+def preprocess_for_line_detection(zone):
+    """
+    Transforme la zone pour détecter toutes les lignes même sur fond coloré
+    - Convertit en gris
+    - Fait un seuillage adaptatif pour transformer fond clair (jaune ou autre) en blanc
+    - Texte noir reste noir
+    """
+    gray = cv2.cvtColor(zone, cv2.COLOR_BGR2GRAY)
+
+    # Seuillage adaptatif (fond clair -> blanc, texte -> noir)
+    processed = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 10
+    )
+    return processed
 
 
 def is_yellow_line(row_img, yellow_rgb=(238, 231, 0), tol=30):
@@ -22,32 +48,63 @@ def is_yellow_line(row_img, yellow_rgb=(238, 231, 0), tol=30):
     return False
 
 
-def preprocess_for_ocr(row_img):
+def preprocess_gray_text(row_img):
     """
-    Prétraitement OCR pour texte gris clair sur fond clair
-    - Inverse le gris si texte clair
-    - Egalisation d'histogramme
-    - Légère netteté
-    - Seuillage adaptatif
+    Texte gris clair sur fond très clair → texte noir sur fond blanc
+    - Lissage léger pour réduire bruit
+    - Conversion en gris
+    - Inversion du contraste selon seuil minimal
     """
+    # Lissage léger
+    img_smooth = cv2.bilateralFilter(row_img, d=5, sigmaColor=50, sigmaSpace=50)
+
+    # Conversion en gris
+    gray = (
+        cv2.cvtColor(img_smooth, cv2.COLOR_BGR2GRAY)
+        if len(row_img.shape) == 3
+        else row_img
+    )
+
+    # Seuillage adaptatif très permissif pour fond blanc / texte noir
+    gray = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 5
+    )
+
+    # Redimensionnement pour OCR
+    h, w = gray.shape
+    gray = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+
+    return gray
+
+
+def preprocess_names_for_ocr(row_img):
+    """
+    Prétraitement doux pour OCR des noms de joueurs
+    - Augmente légèrement le contraste pour mieux voir le texte gris
+    - Lisse le fond pour séparer le texte du fond
+    - Upscale pour que les traits fins (_ par ex.) soient détectés
+    """
+    # Conversion en gris si nécessaire
     gray = (
         cv2.cvtColor(row_img, cv2.COLOR_BGR2GRAY)
         if len(row_img.shape) == 3
         else row_img
     )
 
-    if np.mean(gray) > 180:
-        gray = 255 - gray
+    # Lissage léger pour adoucir le fond
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    gray = cv2.equalizeHist(gray)
-
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    gray = cv2.filter2D(gray, -1, kernel)
-
-    processed = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 10
+    # Étirement doux du contraste (clip autour de 5-95 percentiles)
+    min_val, max_val = np.percentile(blurred, 5), np.percentile(blurred, 95)
+    contrast = np.clip((blurred - min_val) * 255 / (max_val - min_val), 0, 255).astype(
+        np.uint8
     )
-    return processed
+
+    # Upscale léger (x2 pour le texte)
+    h, w = contrast.shape
+    resized = cv2.resize(contrast, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+
+    return resized
 
 
 def simple_resize_only(img, scale=3):
@@ -64,22 +121,50 @@ def simple_resize_only(img, scale=3):
 
 
 def extract_row_simple(row_img, row_idx, team_name, first_line=False):
-    """Extraction simple avec gestion du texte noir sur jaune et première ligne = nom d'équipe"""
+    """Extraction optimisée avec gestion du texte jaune et stats robustes"""
 
     h, w, _ = row_img.shape
-    name_zone = row_img[:, : int(w * 0.20)]
-    stats_zone = row_img[:, int(w * 0.20) :]
+    if first_line:
+        name_zone = row_img[:, : int(w * 0.20)]
+    else:
+        logo_margin = int(w * 0.053)
+        name_zone = row_img[:, logo_margin : int(w * 0.20)]
+    stats_zone = row_img[:, int(w * 0.24) : int(w * 1)]
 
-    # Prétraitement : neutralisation du jaune + redimensionnement
-    name_processed = simple_resize_only((name_zone), scale=4)
-    stats_processed = simple_resize_only((stats_zone), scale=3)
+    # --- Prétraitement noms ---
+    if is_yellow_line(name_zone):
+        name_processed = simple_resize_only(preprocess_gray_text(name_zone), scale=4)
+    else:
+        name_processed = preprocess_names_for_ocr(name_zone)
+
+    # --- Prétraitement stats ---
+    stats_gray = (
+        cv2.cvtColor(stats_zone, cv2.COLOR_BGR2GRAY)
+        if len(stats_zone.shape) == 3
+        else stats_zone
+    )
+
+    # Upscale agressif
+    stats_processed = cv2.resize(
+        stats_gray,
+        (stats_gray.shape[1] * 4, stats_gray.shape[0] * 4),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    # CLAHE pour contraste
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    stats_processed = clahe.apply(stats_processed)
+
+    # Morphological open pour séparer caractères collés
+    kernel = np.ones((2, 2), np.uint8)
+    stats_processed = cv2.morphologyEx(stats_processed, cv2.MORPH_OPEN, kernel)
 
     # Debug
     cv2.imwrite(f"debug_{team_name}_row{row_idx}_names.png", name_processed)
     cv2.imwrite(f"debug_{team_name}_row{row_idx}_stats.png", stats_processed)
 
     try:
-        # OCR noms
+        # --- OCR noms ---
         name_config = r"--oem 3 --psm 7"
         player_name = pytesseract.image_to_string(
             name_processed, config=name_config
@@ -87,7 +172,6 @@ def extract_row_simple(row_img, row_idx, team_name, first_line=False):
         player_name = " ".join(player_name.split())
 
         if first_line:
-            # Première ligne = nom de l'équipe
             return {
                 "team": player_name,
                 "player": "",
@@ -104,9 +188,9 @@ def extract_row_simple(row_img, row_idx, team_name, first_line=False):
                 "lfr_lft": "0/0",
             }
 
-        # OCR stats
+        # --- OCR stats ---
         stats_config = (
-            r"--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789ABCDEFabcdef./-+: "
+            r"--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789./ABCDEF+-_:"
         )
         stats_text = pytesseract.image_to_string(
             stats_processed, config=stats_config
@@ -117,6 +201,17 @@ def extract_row_simple(row_img, row_idx, team_name, first_line=False):
         # Validation du nom
         if len(player_name) < 2 or not any(c.isalpha() for c in player_name):
             player_name = f"Player{row_idx}"
+
+        # --- Correction post-OCR pour fractions ---
+        import re
+
+        def fix_fraction(text):
+            matches = re.findall(r"\d{1,2}/\d{1,2}", text)
+            return matches[0] if matches else text
+
+        tr_tt = fix_fraction(stats_parts[8]) if len(stats_parts) > 8 else "0/0"
+        pr_3pt = fix_fraction(stats_parts[9]) if len(stats_parts) > 9 else "0/0"
+        lfr_lft = fix_fraction(stats_parts[10]) if len(stats_parts) > 10 else "0/0"
 
         return {
             "team": team_name,
@@ -129,9 +224,9 @@ def extract_row_simple(row_img, row_idx, team_name, first_line=False):
             "ctr": stats_parts[5] if len(stats_parts) > 5 else "0",
             "fautes": stats_parts[6] if len(stats_parts) > 6 else "0",
             "bp": stats_parts[7] if len(stats_parts) > 7 else "0",
-            "tr_tt": stats_parts[8] if len(stats_parts) > 8 else "0/0",
-            "3pr_3pt": stats_parts[9] if len(stats_parts) > 9 else "0/0",
-            "lfr_lft": stats_parts[10] if len(stats_parts) > 10 else "0/0",
+            "tr_tt": tr_tt,
+            "3pr_3pt": pr_3pt,
+            "lfr_lft": lfr_lft,
         }
 
     except Exception as e:
