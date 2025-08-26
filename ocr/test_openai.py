@@ -11,6 +11,7 @@ from openai import OpenAI
 <<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 client = OpenAI()
 =======
 client = OpenAI(api_key="key")
@@ -21,6 +22,9 @@ client = OpenAI(api_key="API_KEY")
 =======
 client = OpenAI()
 >>>>>>> 68e793c (Fonctionne pas trop mal sur la détection des zones et des noms.)
+=======
+
+>>>>>>> 058cee4 (Fonctionne pas trop mal sur la détection des zones)
 # Dossiers
 OUTPUT_JSON_DIR = "../data/output/matches_json"
 OUTPUT_CSV_DIR = "../data/output/matches_csv"
