@@ -1,17 +1,33 @@
 import cv2
+from PIL import Image
 import pytesseract
 import pandas as pd
 import numpy as np
 import re
+import easyocr
+
+# Initialisation EasyOCR (en anglais car les stats sont en chiffres)
+reader = easyocr.Reader(["en"], gpu=False)
 
 
 def fix_fraction(text):
-    # Détecte uniquement les fractions 0-99 / 0-99
-    matches = re.findall(r"\b([0-9]|[1-9][0-9]?)/([0-9]|[1-9][0-9]?)\b", text)
+    """Corrige les fractions du type 2/5"""
+    if not text:
+        return "0/0"
+    text = (
+        text.replace("O", "0")
+        .replace("o", "0")
+        .replace("l", "1")
+        .replace("I", "1")
+        .replace(":", "/")
+    )
+    matches = re.findall(r"\d{1,2}/\d{1,2}", text)
     if matches:
-        # Retourne la première fraction trouvée, format "num/den"
-        return f"{matches[0][0]}/{matches[0][1]}"
-    return text
+        return matches[0]
+    numbers = re.findall(r"\d+", text)
+    if len(numbers) >= 2:
+        return f"{numbers[0]}/{numbers[1]}"
+    return "0/0"
 
 
 def preprocess_for_line_detection(zone):
@@ -50,69 +66,95 @@ def is_yellow_line(row_img, yellow_rgb=(238, 231, 0), tol=30):
 
 def preprocess_gray_text(row_img):
     """
-    Texte gris clair sur fond très clair → texte noir sur fond blanc
-    - Lissage léger pour réduire bruit
-    - Conversion en gris
-    - Inversion du contraste selon seuil minimal
+    AMÉLIORÉ: Texte gris clair sur fond très clair/bruité → texte noir sur fond blanc
+    - Débruitage agressif pour éliminer les patterns de fond
+    - Lissage multi-étapes pour uniformiser le fond
+    - Seuillage robuste avec double passage
     """
-    # Lissage léger
-    img_smooth = cv2.bilateralFilter(row_img, d=5, sigmaColor=50, sigmaSpace=50)
+    # Débruitage initial fort pour éliminer patterns de transparence
+    denoised = cv2.fastNlMeansDenoising(row_img, None, 10, 7, 21)
+
+    # Lissage en 2 étapes : bilateral pour préserver contours + gaussien pour fond
+    img_smooth1 = cv2.bilateralFilter(denoised, d=9, sigmaColor=75, sigmaSpace=75)
+    img_smooth2 = cv2.GaussianBlur(img_smooth1, (5, 5), 0)
 
     # Conversion en gris
     gray = (
-        cv2.cvtColor(img_smooth, cv2.COLOR_BGR2GRAY)
+        cv2.cvtColor(img_smooth2, cv2.COLOR_BGR2GRAY)
         if len(row_img.shape) == 3
-        else row_img
+        else img_smooth2
     )
 
-    # Seuillage adaptatif très permissif pour fond blanc / texte noir
-    gray = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 5
+    # Double seuillage pour éliminer le bruit résiduel
+    # 1er passage : seuillage adaptatif permissif
+    thresh1 = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 19, 8
     )
 
-    # Redimensionnement pour OCR
-    h, w = gray.shape
-    gray = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+    # 2ème passage : morphologie pour nettoyer + seuillage Otsu sur le résultat
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    cleaned = cv2.morphologyEx(thresh1, cv2.MORPH_CLOSE, kernel)
 
-    return gray
+    # Redimensionnement pour OCR (plus agressif pour texte difficile)
+    h, w = cleaned.shape
+    resized = cv2.resize(cleaned, (w * 4, h * 4), interpolation=cv2.INTER_CUBIC)
+
+    return resized
 
 
 def preprocess_names_for_ocr(row_img):
     """
-    Prétraitement doux pour OCR des noms de joueurs
-    - Augmente légèrement le contraste pour mieux voir le texte gris
-    - Lisse le fond pour séparer le texte du fond
-    - Upscale pour que les traits fins (_ par ex.) soient détectés
+    AMÉLIORÉ: Prétraitement robuste pour OCR des noms sur fonds bruités
+    - Débruitage préalable pour éliminer patterns de transparence
+    - Amélioration contraste adaptative
+    - Morphologie pour renforcer les caractères fins
     """
-    # Conversion en gris si nécessaire
-    gray = (
-        cv2.cvtColor(row_img, cv2.COLOR_BGR2GRAY)
-        if len(row_img.shape) == 3
-        else row_img
-    )
+    # Débruitage initial pour éliminer le bruit de fond
+    if len(row_img.shape) == 3:
+        denoised = cv2.fastNlMeansDenoising(row_img, None, 8, 7, 21)
+        gray = cv2.cvtColor(denoised, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = cv2.fastNlMeansDenoising(row_img, None, 8, 7, 21)
 
-    # Lissage léger pour adoucir le fond
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    # Lissage adaptatif pour uniformiser le fond sans perdre le texte
+    blurred = cv2.bilateralFilter(gray, 9, 75, 75)
 
-    # Étirement doux du contraste (clip autour de 5-95 percentiles)
-    min_val, max_val = np.percentile(blurred, 5), np.percentile(blurred, 95)
-    contrast = np.clip((blurred - min_val) * 255 / (max_val - min_val), 0, 255).astype(
+    # Amélioration du contraste avec CLAHE local
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(blurred)
+
+    # Étirement du contraste plus agressif pour séparer texte/fond
+    min_val, max_val = np.percentile(enhanced, 2), np.percentile(enhanced, 98)
+    contrast = np.clip((enhanced - min_val) * 255 / (max_val - min_val), 0, 255).astype(
         np.uint8
     )
 
-    # Upscale léger (x2 pour le texte)
+    # Morphologie pour renforcer les traits fins (underscores, etc.)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 1))
+    contrast = cv2.morphologyEx(contrast, cv2.MORPH_CLOSE, kernel)
+
+    # Upscale (plus important pour texte sur fond bruité)
     h, w = contrast.shape
-    resized = cv2.resize(contrast, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+    resized = cv2.resize(contrast, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
 
     return resized
 
 
 def simple_resize_only(img, scale=3):
-    """Redimensionnement simple, accepte image déjà en gris"""
+    """
+    AMÉLIORÉ: Redimensionnement avec débruitage préalable
+    """
+    # Débruitage avant redimensionnement pour éviter d'amplifier le bruit
     if len(img.shape) == 3 and img.shape[2] == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        denoised = cv2.fastNlMeansDenoising(img, None, 8, 7, 21)
+        gray = cv2.cvtColor(denoised, cv2.COLOR_BGR2GRAY)
     else:
-        gray = img
+        gray = (
+            cv2.fastNlMeansDenoising(img, None, 8, 7, 21)
+            if len(img.shape) == 3
+            else img
+        )
+
     height, width = gray.shape
     resized = cv2.resize(
         gray, (width * scale, height * scale), interpolation=cv2.INTER_CUBIC
@@ -120,118 +162,129 @@ def simple_resize_only(img, scale=3):
     return resized
 
 
-def extract_row_simple(row_img, row_idx, team_name, first_line=False):
-    """Extraction optimisée avec gestion du texte jaune et stats robustes"""
+def extract_row_simple(
+    row_img, row_idx, team_name, first_line=False, output_dir="debug_cols"
+):
+    """Extraction OCR hybride : noms avec Tesseract, note avec A-G+- et stats numériques/fractions"""
+    import os
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
     h, w, _ = row_img.shape
+
+    # --- Zone nom ---
     if first_line:
         name_zone = row_img[:, : int(w * 0.20)]
     else:
         logo_margin = int(w * 0.053)
         name_zone = row_img[:, logo_margin : int(w * 0.20)]
-    stats_zone = row_img[:, int(w * 0.24) : int(w * 1)]
 
-    # --- Prétraitement noms ---
-    if is_yellow_line(name_zone):
-        name_processed = simple_resize_only(preprocess_gray_text(name_zone), scale=4)
-    else:
-        name_processed = preprocess_names_for_ocr(name_zone)
+    # --- Zone stats ---
+    stats_zone = row_img[:, int(w * 0.24) :]
 
-    # --- Prétraitement stats ---
-    stats_gray = (
-        cv2.cvtColor(stats_zone, cv2.COLOR_BGR2GRAY)
-        if len(stats_zone.shape) == 3
-        else stats_zone
-    )
+    # --- OCR noms avec Tesseract ---
+    name_processed = cv2.cvtColor(name_zone, cv2.COLOR_BGR2GRAY)
+    name_config = r"--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./+-_: "
+    player_name = pytesseract.image_to_string(
+        name_processed, config=name_config
+    ).strip()
+    player_name = " ".join(player_name.split())
 
-    # Upscale agressif
-    stats_processed = cv2.resize(
-        stats_gray,
-        (stats_gray.shape[1] * 4, stats_gray.shape[0] * 4),
-        interpolation=cv2.INTER_CUBIC,
-    )
-
-    # CLAHE pour contraste
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    stats_processed = clahe.apply(stats_processed)
-
-    # Morphological open pour séparer caractères collés
-    kernel = np.ones((2, 2), np.uint8)
-    stats_processed = cv2.morphologyEx(stats_processed, cv2.MORPH_OPEN, kernel)
-
-    # Debug
-    cv2.imwrite(f"debug_{team_name}_row{row_idx}_names.png", name_processed)
-    cv2.imwrite(f"debug_{team_name}_row{row_idx}_stats.png", stats_processed)
-
-    try:
-        # --- OCR noms ---
-        name_config = r"--oem 3 --psm 7"
-        player_name = pytesseract.image_to_string(
-            name_processed, config=name_config
-        ).strip()
-        player_name = " ".join(player_name.split())
-
-        if first_line:
-            return {
-                "team": player_name,
-                "player": "",
-                "note": "",
-                "pts": "0",
-                "reb": "0",
-                "pad": "0",
-                "int": "0",
-                "ctr": "0",
-                "fautes": "0",
-                "bp": "0",
-                "tr_tt": "0/0",
-                "3pr_3pt": "0/0",
-                "lfr_lft": "0/0",
-            }
-
-        # --- OCR stats ---
-        stats_config = (
-            r"--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789./ABCDEF+-_:"
-        )
-        stats_text = pytesseract.image_to_string(
-            stats_processed, config=stats_config
-        ).strip()
-        stats_text = " ".join(stats_text.split())
-        stats_parts = stats_text.split()
-
-        # Validation du nom
-        if len(player_name) < 2 or not any(c.isalpha() for c in player_name):
-            player_name = f"Player{row_idx}"
-
-        # --- Correction post-OCR pour fractions ---
-        import re
-
-        def fix_fraction(text):
-            matches = re.findall(r"\d{1,2}/\d{1,2}", text)
-            return matches[0] if matches else text
-
-        tr_tt = fix_fraction(stats_parts[8]) if len(stats_parts) > 8 else "0/0"
-        pr_3pt = fix_fraction(stats_parts[9]) if len(stats_parts) > 9 else "0/0"
-        lfr_lft = fix_fraction(stats_parts[10]) if len(stats_parts) > 10 else "0/0"
-
+    if first_line:
         return {
-            "team": team_name,
-            "player": player_name,
-            "note": stats_parts[0] if len(stats_parts) > 0 else "",
-            "pts": stats_parts[1] if len(stats_parts) > 1 else "0",
-            "reb": stats_parts[2] if len(stats_parts) > 2 else "0",
-            "pad": stats_parts[3] if len(stats_parts) > 3 else "0",
-            "int": stats_parts[4] if len(stats_parts) > 4 else "0",
-            "ctr": stats_parts[5] if len(stats_parts) > 5 else "0",
-            "fautes": stats_parts[6] if len(stats_parts) > 6 else "0",
-            "bp": stats_parts[7] if len(stats_parts) > 7 else "0",
-            "tr_tt": tr_tt,
-            "3pr_3pt": pr_3pt,
-            "lfr_lft": lfr_lft,
+            "team": player_name,
+            "player": "",
+            "note": "",
+            "pts": "",
+            "reb": "",
+            "pad": "",
+            "int": "",
+            "ctr": "",
+            "fautes": "",
+            "bp": "",
+            "tr_tt": "",
+            "3pr_3pt": "",
+            "lfr_lft": "",
         }
 
-    except Exception as e:
-        print(f"Erreur OCR ligne {row_idx}: {e}")
-        return None
+    # --- Découpage des colonnes de stats ---
+    col_ratios = [
+        0,
+        0.08,
+        0.16,
+        0.24,
+        0.32,
+        0.40,
+        0.48,
+        0.56,
+        0.66,
+        0.75,
+        0.90,
+        1.0,
+    ]  # ajuster selon ton image
+    stats_values = []
+
+    for i in range(len(col_ratios) - 1):
+        x1 = int(stats_zone.shape[1] * col_ratios[i])
+        x2 = int(stats_zone.shape[1] * col_ratios[i + 1])
+        col_img = stats_zone[:, x1:x2]
+        col_gray = (
+            cv2.cvtColor(col_img, cv2.COLOR_BGR2GRAY)
+            if len(col_img.shape) == 3
+            else col_img
+        )
+        col_gray = cv2.resize(
+            col_gray,
+            (col_gray.shape[1] * 4, col_gray.shape[0] * 4),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        cv2.imwrite(f"{output_dir}/{team_name}_row{row_idx}_col{i}.png", col_gray)
+
+        val_list = reader.readtext(col_gray, detail=0, paragraph=False)
+        val = val_list[0].strip() if val_list else "0"
+
+        # Colonne note = A-G + +/-
+        if i == 0:
+            val = val.upper()
+            val = re.sub(r"[^A-G+-_]", "", val)
+        # Autres stats = numériques et fractions seulement
+        else:
+            val = re.sub(r"[^0-9/]", "", val)
+            val = (
+                val.replace("O", "0")
+                .replace("o", "0")
+                .replace("l", "1")
+                .replace("I", "1")
+                .replace(":", "/")
+            )
+
+        stats_values.append(val)
+
+    # Validation nom joueur
+    if len(player_name) < 2 or not any(c.isalpha() for c in player_name):
+        player_name = f"Player{row_idx}"
+
+    # Correction fractions
+    tr_tt = fix_fraction(stats_values[-3]) if len(stats_values) >= 3 else "0/0"
+    pr_3pt = fix_fraction(stats_values[-2]) if len(stats_values) >= 2 else "0/0"
+    lfr_lft = fix_fraction(stats_values[-1]) if len(stats_values) >= 1 else "0/0"
+
+    return {
+        "team": team_name,
+        "player": player_name,
+        "note": stats_values[0] if len(stats_values) > 0 else "",
+        "pts": stats_values[1] if len(stats_values) > 1 else "0",
+        "reb": stats_values[2] if len(stats_values) > 2 else "0",
+        "pad": stats_values[3] if len(stats_values) > 3 else "0",
+        "int": stats_values[4] if len(stats_values) > 4 else "0",
+        "ctr": stats_values[5] if len(stats_values) > 5 else "0",
+        "fautes": stats_values[6] if len(stats_values) > 6 else "0",
+        "bp": stats_values[7] if len(stats_values) > 7 else "0",
+        "tr_tt": tr_tt,
+        "3pr_3pt": pr_3pt,
+        "lfr_lft": lfr_lft,
+    }
 
 
 def detect_text_rows_simple(zone):
@@ -304,7 +357,7 @@ def extract_team_data_simple(zone, team_name):
 
 def main():
     # Chargement de l'image
-    img = cv2.imread("../data/images/image.png")
+    img = cv2.imread("../data/images/image2.jpeg")
     if img is None:
         print("Erreur: impossible de charger l'image")
         return
@@ -328,7 +381,7 @@ def main():
     cv2.imwrite("debug_team1_zone_original.png", team1_zone)
     cv2.imwrite("debug_team2_zone_original.png", team2_zone)
 
-    print("\n=== Extraction SIMPLE (sans preprocessing) ===")
+    print("\n=== Extraction avec PREPROCESSING AMÉLIORÉ ===")
 
     # Extraction simple
     team1_data = extract_team_data_simple(team1_zone, "Team 1")
@@ -355,7 +408,7 @@ def main():
 
 def test_direct_ocr():
     """Test OCR direct sur l'image complète pour voir ce qui est détecté"""
-    img = cv2.imread("../data/images/image.png")
+    img = cv2.imread("../data/images/image2.jpeg")
     if img is None:
         print("Image non trouvée")
         return
