@@ -357,7 +357,7 @@ def extract_team_data_simple(zone, team_name):
 
 def main():
     # Chargement de l'image
-    img = cv2.imread("../data/images/image7.jpeg")
+    img = cv2.imread("../data/images/image5.jpeg")
     if img is None:
         print("Erreur: impossible de charger l'image")
         return
@@ -408,7 +408,7 @@ def main():
 
 def test_direct_ocr():
     """Test OCR direct sur l'image complète pour voir ce qui est détecté"""
-    img = cv2.imread("../data/images/image7.jpeg")
+    img = cv2.imread("../data/images/image5.jpeg")
     if img is None:
         print("Image non trouvée")
         return
