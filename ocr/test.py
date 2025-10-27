@@ -4,7 +4,10 @@ import pytesseract
 import pandas as pd
 import numpy as np
 import re
+import os
 import easyocr
+import time
+from collections import Counter
 
 # Initialisation EasyOCR (en anglais car les stats sont en chiffres)
 reader = easyocr.Reader(["en"], gpu=False)
@@ -28,6 +31,33 @@ def fix_fraction(text):
     if len(numbers) >= 2:
         return f"{numbers[0]}/{numbers[1]}"
     return "0/0"
+
+
+def fix_zeros_ones_majority(val_list):
+    """
+    Prend une liste de valeurs OCRisées (ex: après 5 ou 10 passes)
+    et applique un vote majoritaire pour corriger les 0/1.
+    """
+    if not val_list:
+        return "0"
+
+    cleaned = []
+    for val in val_list:
+        if not val:
+            continue
+        v = val.replace("O", "0").replace("o", "0")
+        v = v.replace("I", "1").replace("l", "1").replace("|", "1")
+        v = re.sub(r"[^0-9/]", "", v)
+        if v:
+            cleaned.append(v)
+
+    if not cleaned:
+        return "0"
+
+    # Vote majoritaire
+    counter = Counter(cleaned)
+    most_common_val, _ = counter.most_common(1)[0]
+    return most_common_val
 
 
 def preprocess_for_line_detection(zone):
@@ -140,6 +170,28 @@ def preprocess_names_for_ocr(row_img):
     return resized
 
 
+def extract_scoreboard(img):
+    """
+    Extrait les scores avec EasyOCR (haut=team1, bas=team2).
+    """
+    h, w, _ = img.shape
+    scoreboard_zone = img[int(h * 0.33) : int(h * 0.61), int(w * 0.19) : int(w * 0.25)]
+    sh, sw, _ = scoreboard_zone.shape
+
+    team1_zone = scoreboard_zone[0 : int(sh * 0.47), :]
+    team2_zone = scoreboard_zone[int(sh * 0.5) :, :]
+
+    def ocr_score(zone, filename):
+        cv2.imwrite(filename, zone)
+        results = reader.readtext(zone, detail=0, allowlist="0123456789")
+        return results[0] if results else "0"
+
+    team1_score = ocr_score(team1_zone, "debug_team1_easy.png")
+    team2_score = ocr_score(team2_zone, "debug_team2_easy.png")
+
+    return {"team1_score": team1_score, "team2_score": team2_score}
+
+
 def simple_resize_only(img, scale=3):
     """
     AMÉLIORÉ: Redimensionnement avec débruitage préalable
@@ -162,11 +214,250 @@ def simple_resize_only(img, scale=3):
     return resized
 
 
-def extract_row_simple(
-    row_img, row_idx, team_name, first_line=False, output_dir="debug_cols"
+# def extract_row_simple(
+#     row_img, row_idx, team_name, first_line=False, output_dir="debug_cols"
+# ):
+#     """Extraction OCR hybride avec sauvegarde des zones nom et stats"""
+
+#     import os
+
+#     if not os.path.exists(output_dir):
+#         os.makedirs(output_dir)
+
+#     h, w, _ = row_img.shape
+
+#     # --- Zone nom ---
+#     if first_line:
+#         name_zone = row_img[:, : int(w * 0.20)]
+#     else:
+#         logo_margin = int(w * 0.053)
+#         name_zone = row_img[:, logo_margin : int(w * 0.20)]
+
+#     # --- Zone stats ---
+#     stats_zone = row_img[:, int(w * 0.24) :]
+
+#     # --- Sauvegarde des zones complètes ---
+#     cv2.imwrite(f"{output_dir}/{team_name}_row{row_idx}_full.png", row_img)
+#     cv2.imwrite(f"{output_dir}/{team_name}_row{row_idx}_name_zone.png", name_zone)
+#     cv2.imwrite(f"{output_dir}/{team_name}_row{row_idx}_stats_zone.png", stats_zone)
+
+#     # --- OCR noms avec Tesseract ---
+#     name_processed = cv2.cvtColor(name_zone, cv2.COLOR_BGR2GRAY)
+#     name_config = r"--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./+-_: "
+#     player_name = pytesseract.image_to_string(
+#         name_processed, config=name_config
+#     ).strip()
+#     player_name = " ".join(player_name.split())
+
+#     if first_line:
+#         return {
+#             "team": player_name,
+#             "player": "",
+#             "note": "",
+#             "pts": "",
+#             "reb": "",
+#             "pad": "",
+#             "int": "",
+#             "ctr": "",
+#             "fautes": "",
+#             "bp": "",
+#             "tr_tt": "",
+#             "3pr_3pt": "",
+#             "lfr_lft": "",
+#         }
+
+#     # --- Découpage des colonnes de stats ---
+#     col_ratios = [0, 0.08, 0.16, 0.24, 0.32, 0.40, 0.48, 0.56, 0.66, 0.75, 0.90, 1.0]
+#     stats_values = []
+
+#     for i in range(len(col_ratios) - 1):
+#         x1 = int(stats_zone.shape[1] * col_ratios[i])
+#         x2 = int(stats_zone.shape[1] * col_ratios[i + 1])
+#         col_img = stats_zone[:, x1:x2]
+#         col_gray = (
+#             cv2.cvtColor(col_img, cv2.COLOR_BGR2GRAY)
+#             if len(col_img.shape) == 3
+#             else col_img
+#         )
+#         col_gray = cv2.resize(
+#             col_gray,
+#             (col_gray.shape[1] * 4, col_gray.shape[0] * 4),
+#             interpolation=cv2.INTER_CUBIC,
+#         )
+
+#         # --- Sauvegarde de chaque colonne ---
+#         cv2.imwrite(f"{output_dir}/{team_name}_row{row_idx}_col{i}.png", col_gray)
+
+#         val_list = reader.readtext(col_gray, detail=0, paragraph=False)
+#         val = val_list[0].strip() if val_list else "0"
+
+#         # Colonne note = A-G + +/-
+#         if i == 0:
+#             val = val.upper()
+#             val = re.sub(r"[^A-G+-_]", "", val)
+#         # Autres stats = numériques et fractions seulement
+#         else:
+#             val = re.sub(r"[^0-9/]", "", val)
+#             val = (
+#                 val.replace("O", "0")
+#                 .replace("o", "0")
+#                 .replace("l", "1")
+#                 .replace("I", "1")
+#                 .replace(":", "/")
+#             )
+
+#         stats_values.append(val)
+
+#     # Validation nom joueur
+#     if len(player_name) < 2 or not any(c.isalpha() for c in player_name):
+#         player_name = f"Player{row_idx}"
+
+#     # Correction fractions
+#     tr_tt = fix_fraction(stats_values[-3]) if len(stats_values) >= 3 else "0/0"
+#     pr_3pt = fix_fraction(stats_values[-2]) if len(stats_values) >= 2 else "0/0"
+#     lfr_lft = fix_fraction(stats_values[-1]) if len(stats_values) >= 1 else "0/0"
+
+#     return {
+#         "team": team_name,
+#         "player": player_name,
+#         "note": stats_values[0] if len(stats_values) > 0 else "",
+#         "pts": stats_values[1] if len(stats_values) > 1 else "0",
+#         "reb": stats_values[2] if len(stats_values) > 2 else "0",
+#         "pad": stats_values[3] if len(stats_values) > 3 else "0",
+#         "int": stats_values[4] if len(stats_values) > 4 else "0",
+#         "ctr": stats_values[5] if len(stats_values) > 5 else "0",
+#         "fautes": stats_values[6] if len(stats_values) > 6 else "0",
+#         "bp": stats_values[7] if len(stats_values) > 7 else "0",
+#         "tr_tt": tr_tt,
+#         "3pr_3pt": pr_3pt,
+#         "lfr_lft": lfr_lft,
+#     }
+
+
+# def extract_row_easyocr(
+#     row_img, row_idx, team_name, first_line=False, output_dir="debug_cols"
+# ):
+#     """
+#     Extraction OCR avec EasyOCR : noms et stats.
+#     """
+#     import os
+
+#     if not os.path.exists(output_dir):
+#         os.makedirs(output_dir)
+
+#     h, w, _ = row_img.shape
+
+#     # --- Zone nom ---
+#     if first_line:
+#         name_zone = row_img[:, : int(w * 0.20)]
+#     else:
+#         logo_margin = int(w * 0.053)
+#         name_zone = row_img[:, logo_margin : int(w * 0.20)]
+
+#     # --- Zone stats ---
+#     stats_zone = row_img[:, int(w * 0.24) :]
+
+#     # --- OCR noms avec EasyOCR ---
+#     name_processed = preprocess_names_for_ocr(name_zone)
+#     name_results = reader.readtext(name_processed, detail=0)
+#     player_name = name_results[0].strip() if name_results else f"Player{row_idx}"
+#     player_name = " ".join(player_name.split())
+
+#     if first_line:
+#         return {
+#             "team": player_name,
+#             "player": "",
+#             "note": "",
+#             "pts": "",
+#             "reb": "",
+#             "pad": "",
+#             "int": "",
+#             "ctr": "",
+#             "fautes": "",
+#             "bp": "",
+#             "tr_tt": "",
+#             "3pr_3pt": "",
+#             "lfr_lft": "",
+#         }
+
+#     # --- Découpage des colonnes de stats ---
+#     col_ratios = [
+#         0,
+#         0.08,
+#         0.16,
+#         0.24,
+#         0.32,
+#         0.40,
+#         0.48,
+#         0.56,
+#         0.66,
+#         0.75,
+#         0.90,
+#         1.0,
+#     ]
+#     stats_values = []
+
+#     for i in range(len(col_ratios) - 1):
+#         x1 = int(stats_zone.shape[1] * col_ratios[i])
+#         x2 = int(stats_zone.shape[1] * col_ratios[i + 1])
+#         col_img = stats_zone[:, x1:x2]
+#         col_gray = (
+#             cv2.cvtColor(col_img, cv2.COLOR_BGR2GRAY)
+#             if len(col_img.shape) == 3
+#             else col_img
+#         )
+#         col_gray = cv2.resize(
+#             col_gray,
+#             (col_gray.shape[1] * 4, col_gray.shape[0] * 4),
+#             interpolation=cv2.INTER_CUBIC,
+#         )
+#         cv2.imwrite(f"{output_dir}/{team_name}_row{row_idx}_col{i}.png", col_gray)
+
+#         val_list = reader.readtext(col_gray, detail=0)
+#         val = val_list[0].strip() if val_list else "0"
+
+#         # Colonne note = A-G + +/-
+#         if i == 0:
+#             val = val.upper()
+#             val = re.sub(r"[^A-G+-_]", "", val)
+#         else:
+#             val = re.sub(r"[^0-9/]", "", val)
+#             val = (
+#                 val.replace("O", "0")
+#                 .replace("o", "0")
+#                 .replace("l", "1")
+#                 .replace("I", "1")
+#                 .replace(":", "/")
+#             )
+
+#         stats_values.append(val)
+
+#     # Correction fractions
+#     tr_tt = fix_fraction(stats_values[-3]) if len(stats_values) >= 3 else "0/0"
+#     pr_3pt = fix_fraction(stats_values[-2]) if len(stats_values) >= 2 else "0/0"
+#     lfr_lft = fix_fraction(stats_values[-1]) if len(stats_values) >= 1 else "0/0"
+
+#     return {
+#         "team": team_name,
+#         "player": player_name,
+#         "note": stats_values[0] if len(stats_values) > 0 else "",
+#         "pts": stats_values[1] if len(stats_values) > 1 else "0",
+#         "reb": stats_values[2] if len(stats_values) > 2 else "0",
+#         "pad": stats_values[3] if len(stats_values) > 3 else "0",
+#         "int": stats_values[4] if len(stats_values) > 4 else "0",
+#         "ctr": stats_values[5] if len(stats_values) > 5 else "0",
+#         "fautes": stats_values[6] if len(stats_values) > 6 else "0",
+#         "bp": stats_values[7] if len(stats_values) > 7 else "0",
+#         "tr_tt": tr_tt,
+#         "3pr_3pt": pr_3pt,
+#         "lfr_lft": lfr_lft,
+#     }
+
+
+def extract_row_simple_postprocess(
+    row_img, row_idx, team_name, first_line=False, output_dir="debug_cols", n_passes=5
 ):
-    """Extraction OCR hybride : noms avec Tesseract, note avec A-G+- et stats numériques/fractions"""
-    import os
+    """Extraction OCR hybride avec Tesseract et post-processing multi-pass uniquement pour les 0/1"""
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -183,7 +474,7 @@ def extract_row_simple(
     # --- Zone stats ---
     stats_zone = row_img[:, int(w * 0.24) :]
 
-    # --- OCR noms avec Tesseract ---
+    # --- OCR noms ---
     name_processed = cv2.cvtColor(name_zone, cv2.COLOR_BGR2GRAY)
     name_config = r"--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789./+-_: "
     player_name = pytesseract.image_to_string(
@@ -209,20 +500,7 @@ def extract_row_simple(
         }
 
     # --- Découpage des colonnes de stats ---
-    col_ratios = [
-        0,
-        0.08,
-        0.16,
-        0.24,
-        0.32,
-        0.40,
-        0.48,
-        0.56,
-        0.66,
-        0.75,
-        0.90,
-        1.0,
-    ]  # ajuster selon ton image
+    col_ratios = [0, 0.08, 0.16, 0.24, 0.32, 0.40, 0.48, 0.56, 0.66, 0.75, 0.90, 1.0]
     stats_values = []
 
     for i in range(len(col_ratios) - 1):
@@ -241,15 +519,17 @@ def extract_row_simple(
         )
         cv2.imwrite(f"{output_dir}/{team_name}_row{row_idx}_col{i}.png", col_gray)
 
-        val_list = reader.readtext(col_gray, detail=0, paragraph=False)
-        val = val_list[0].strip() if val_list else "0"
+        # --- OCR multi-pass uniquement si c'est un score binaire (0/1) ---
+        val_candidates = []
+        # Lecture initiale
+        val = pytesseract.image_to_string(col_gray, config=r"--oem 3 --psm 7").strip()
 
-        # Colonne note = A-G + +/-
         if i == 0:
+            # Colonne note = A-G + +/-
             val = val.upper()
             val = re.sub(r"[^A-G+-_]", "", val)
-        # Autres stats = numériques et fractions seulement
         else:
+            # Stats numériques/fractions
             val = re.sub(r"[^0-9/]", "", val)
             val = (
                 val.replace("O", "0")
@@ -258,6 +538,17 @@ def extract_row_simple(
                 .replace("I", "1")
                 .replace(":", "/")
             )
+
+        # Si c'est 0 ou 1, refaire n_passes et faire un vote majoritaire
+        if val in ["0", "1"]:
+            val_candidates.append(val)
+            for _ in range(n_passes - 1):
+                tmp_val = pytesseract.image_to_string(
+                    col_gray, config=r"--oem 3 --psm 7"
+                ).strip()
+                tmp_val = re.sub(r"[^01]", "", tmp_val) or "0"
+                val_candidates.append(tmp_val)
+            val = Counter(val_candidates).most_common(1)[0][0]
 
         stats_values.append(val)
 
@@ -337,7 +628,7 @@ def extract_team_data_simple(zone, team_name):
     # Extraire le nom de l'équipe depuis la première ligne
     first_y1, first_y2 = row_groups[0]
     first_line_img = zone[first_y1:first_y2, :]
-    team_name_detected = extract_row_simple(
+    team_name_detected = extract_row_simple_postprocess(
         first_line_img, 0, team_name, first_line=True
     )["team"]
 
@@ -348,62 +639,11 @@ def extract_team_data_simple(zone, team_name):
         if row_img.shape[0] < 10:
             continue
 
-        player_data = extract_row_simple(row_img, idx, team_name_detected)
+        player_data = extract_row_simple_postprocess(row_img, idx, team_name_detected)
         if player_data:
             players_data.append(player_data)
 
     return players_data
-
-
-def main():
-    # Chargement de l'image
-    img = cv2.imread("../data/images/image5.jpeg")
-    if img is None:
-        print("Erreur: impossible de charger l'image")
-        return
-
-    h, w, _ = img.shape
-    print(f"Dimensions de l'image: {w}x{h}")
-
-    # Coordonnées des tableaux (ajustez si nécessaire)
-    team1_coords = (int(h * 0.19), int(h * 0.44), int(w * 0.30), int(w * 0.92))
-    team2_coords = (int(h * 0.475), int(h * 0.73), int(w * 0.30), int(w * 0.92))
-
-    # Extraction des zones
-    team1_zone = img[
-        team1_coords[0] : team1_coords[1], team1_coords[2] : team1_coords[3]
-    ]
-    team2_zone = img[
-        team2_coords[0] : team2_coords[1], team2_coords[2] : team2_coords[3]
-    ]
-
-    # Sauvegarde des zones complètes pour debug
-    cv2.imwrite("debug_team1_zone_original.png", team1_zone)
-    cv2.imwrite("debug_team2_zone_original.png", team2_zone)
-
-    print("\n=== Extraction avec PREPROCESSING AMÉLIORÉ ===")
-
-    # Extraction simple
-    team1_data = extract_team_data_simple(team1_zone, "Team 1")
-    team2_data = extract_team_data_simple(team2_zone, "Team 2")
-
-    # Compilation des résultats
-    all_data = team1_data + team2_data
-
-    if not all_data:
-        print("Aucune donnée extraite.")
-        return None
-
-    # Création du DataFrame
-    df = pd.DataFrame(all_data)
-    print(f"\n=== Résultats finaux ({len(all_data)} joueurs) ===")
-    print(df)
-
-    # Sauvegarde
-    df.to_csv("nba2k_stats.csv", index=False)
-    print("\nDonnées sauvegardées dans 'nba2k_stats.csv'")
-
-    return df
 
 
 def test_direct_ocr():
@@ -420,6 +660,82 @@ def test_direct_ocr():
     print("=== OCR COMPLET DE L'IMAGE ===")
     print(text)
     print("=" * 50)
+
+
+def main():
+    start_time = time.time()  # début du chronomètre
+
+    # Chargement de l'image
+    img = cv2.imread("../data/images/image5.jpeg")
+    if img is None:
+        print("Erreur: impossible de charger l'image")
+        return
+
+    h, w, _ = img.shape
+    print(f"Dimensions originales de l'image: {w}x{h}")
+
+    # # --- Resize pour le scoreboard seulement ---
+    # target_w, target_h = 2048, 1152
+    # img_for_scoreboard = img.copy()
+    # if (w, h) != (target_w, target_h):
+    #     img_for_scoreboard = cv2.resize(
+    #         img_for_scoreboard, (target_w, target_h), interpolation=cv2.INTER_CUBIC
+    #     )
+    #     print(f"Image pour scoreboard redimensionnée à: {target_w}x{target_h}")
+
+    # Coordonnées des tableaux (utiliser l'image originale pour stats)
+    team1_coords = (int(h * 0.19), int(h * 0.44), int(w * 0.30), int(w * 0.92))
+    team2_coords = (int(h * 0.475), int(h * 0.73), int(w * 0.30), int(w * 0.92))
+
+    # Extraction des zones pour stats
+    team1_zone = img[
+        team1_coords[0] : team1_coords[1], team1_coords[2] : team1_coords[3]
+    ]
+    team2_zone = img[
+        team2_coords[0] : team2_coords[1], team2_coords[2] : team2_coords[3]
+    ]
+
+    # Extraction simple
+    team1_data = extract_team_data_simple(team1_zone, "Team 1")
+    team2_data = extract_team_data_simple(team2_zone, "Team 2")
+
+    if not team1_data or not team2_data:
+        print("Aucune donnée extraite.")
+        return None
+
+    # Noms détectés
+    team1_name = team1_data[0]["team"]
+    team2_name = team2_data[0]["team"]
+
+    all_data = team1_data + team2_data
+
+    # Extraction scoreboard sur l'image redimensionnée
+    scores = extract_scoreboard(img)
+    print("\n=== SCORES ===")
+    scores_with_names = {
+        team1_name: scores["team1_score"],
+        team2_name: scores["team2_score"],
+    }
+    print(scores_with_names)
+
+    # Création du DataFrame
+    df = pd.DataFrame(all_data)
+    print(f"\n=== Résultats finaux ({len(all_data)} joueurs) ===")
+    print(df)
+
+    # Ajout du score au CSV
+    df["team1_name"] = team1_name
+    df["team1_score"] = scores["team1_score"]
+    df["team2_name"] = team2_name
+    df["team2_score"] = scores["team2_score"]
+    df.to_csv("nba2k_stats.csv", index=False)
+    print("\nDonnées sauvegardées dans 'nba2k_stats.csv'")
+
+    end_time = time.time()  # fin du chronomètre
+    elapsed = end_time - start_time
+    print(f"\nTemps d'exécution total: {elapsed:.2f} secondes")
+
+    return df
 
 
 if __name__ == "__main__":
