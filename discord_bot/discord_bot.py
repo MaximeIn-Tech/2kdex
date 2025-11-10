@@ -10,7 +10,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GUILD_ID = 1295459991452651540
 CHANNEL_ID = 1423652421519016049
-SAVE_DIR = os.getenv("SAV_DIR")
+SAVE_DIR = os.getenv("SAVE_DIR")
 CSV_PATH = os.path.join(SAVE_DIR, "all_stats.csv")
 
 intents = discord.Intents.default()
