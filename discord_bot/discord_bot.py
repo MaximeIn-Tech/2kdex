@@ -6,6 +6,7 @@ from ocr.test2 import main
 from discord.ui import View
 from dotenv import load_dotenv
 import io
+import re
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -27,10 +28,19 @@ async def on_ready():
     print(f"{client.user} connecté et prêt!")
 
 
+def sanitize_filename(text):
+    """Nettoie le texte pour créer un nom de fichier valide"""
+    # Remplace les caractères invalides par des underscores
+    text = re.sub(r'[<>:"/\\|?*]', "_", text)
+    # Limite la longueur
+    return text[:50]
+
+
 class ExportMatchCSVView(View):
-    def __init__(self, df):
+    def __init__(self, df, filename):
         super().__init__(timeout=None)
         self.df = df
+        self.filename = filename
 
     @discord.ui.button(
         label="📤 Télécharger ce match en CSV", style=discord.ButtonStyle.primary
@@ -47,7 +57,7 @@ class ExportMatchCSVView(View):
             # Créer un fichier Discord à partir du buffer
             csv_file = discord.File(
                 fp=io.BytesIO(csv_buffer.getvalue().encode("utf-8")),
-                filename=f"match_stats.csv",
+                filename=self.filename,
             )
 
             await interaction.response.send_message(
@@ -87,6 +97,17 @@ async def on_message(message):
                 df = main(file_path)
 
                 if df is not None and not df.empty:
+                    # Extraire les informations du match
+                    team1_name = sanitize_filename(str(df["team1_name"].iloc[0]))
+                    team2_name = sanitize_filename(str(df["team2_name"].iloc[0]))
+                    team1_score = df["team1_score"].iloc[0]
+                    team2_score = df["team2_score"].iloc[0]
+
+                    # Créer un nom de fichier dynamique
+                    dynamic_filename = (
+                        f"{team1_name}_{team1_score}-{team2_score}_{team2_name}.csv"
+                    )
+
                     # Sauvegarder dans le CSV global
                     df.to_csv(
                         CSV_PATH,
@@ -98,7 +119,9 @@ async def on_message(message):
                     # Formatter le DataFrame pour l'affichage
                     df_display = df.to_string(index=False)
 
-                    view = ExportMatchCSVView(df)
+                    # Créer la vue avec le nom de fichier dynamique
+                    view = ExportMatchCSVView(df, dynamic_filename)
+
                     # Envoyer le DataFrame formaté
                     await message.channel.send(f"```\n{df_display}\n```", view=view)
 
