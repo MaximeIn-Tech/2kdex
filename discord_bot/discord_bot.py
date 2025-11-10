@@ -2,6 +2,7 @@ import discord
 import os
 import aiohttp
 from ocr.test2 import main
+from discord.ui import View, Button
 
 from dotenv import load_dotenv
 
@@ -27,6 +28,43 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 @client.event
 async def on_ready():
     print(f"{client.user} connecté et prêt!")
+
+
+class ExportCSVView(View):
+    def __init__(self, csv_path):
+        super().__init__(timeout=None)
+        self.csv_path = csv_path
+
+    @discord.ui.button(label="📤 Exporter en CSV", style=discord.ButtonStyle.primary)
+    async def export_csv(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        user = interaction.user
+        try:
+            if not os.path.exists(self.csv_path):
+                await interaction.response.send_message(
+                    "⚠️ Aucun fichier CSV trouvé.", ephemeral=True
+                )
+                return
+
+            await interaction.response.send_message(
+                "📩 Envoi du CSV en message privé...", ephemeral=True
+            )
+
+            # Envoi du fichier en DM
+            await user.send(
+                "Voici le CSV complet avec toutes les statistiques :",
+                file=discord.File(self.csv_path),
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Impossible d’envoyer un DM. Active tes messages privés pour ce serveur.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Erreur lors de l’envoi du CSV : {e}", ephemeral=True
+            )
 
 
 @client.event
@@ -82,16 +120,18 @@ async def on_message(message):
                                     + "\n```"
                                 )
 
-                                await message.channel.send(
-                                    f"Stats extraites :\n{table_str}"
-                                )
-
                                 # Sauvegarde cumulatif CSV
                                 df.to_csv(
                                     CSV_PATH,
                                     mode="a",
                                     index=False,
                                     header=not os.path.exists(CSV_PATH),
+                                )
+
+                                view = ExportCSVView(CSV_PATH)
+                                await message.channel.send(
+                                    f"Score du match : **{team1_name} {team1_score} - {team2_score} {team2_name}**",
+                                    view=view,
                                 )
                             else:
                                 await message.channel.send(
