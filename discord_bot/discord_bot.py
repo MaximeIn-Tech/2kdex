@@ -98,14 +98,9 @@ async def on_message(message):
                     # Formatter le DataFrame pour l'affichage
                     df_display = df.to_string(index=False)
 
-                    # Envoyer le DataFrame formaté
-                    await message.channel.send(f"```\n{df_display}\n```")
-
-                    # Envoyer le bouton d'export en dessous
                     view = ExportMatchCSVView(df)
-                    await message.channel.send(
-                        "📥 Télécharge les stats de ce match :", view=view
-                    )
+                    # Envoyer le DataFrame formaté
+                    await message.channel.send(f"```\n{df_display}\n```", view=view)
 
 
 # IMPORTANT : client.run() doit être HORS de la fonction on_message !
