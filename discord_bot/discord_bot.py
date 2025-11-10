@@ -116,6 +116,11 @@ async def on_message(message):
                         header=not os.path.exists(CSV_PATH),
                     )
 
+                    # 1. Envoyer le score du match
+                    await message.channel.send(
+                        f"**Score du match : {team1_name} {team1_score} - {team2_score} {team2_name}** ⚡"
+                    )
+
                     # Formatter le DataFrame pour l'affichage
                     df_display = df.to_string(index=False)
 
