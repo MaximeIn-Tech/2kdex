@@ -5,6 +5,7 @@ import aiohttp
 from ocr.test2 import main
 from discord.ui import View
 from dotenv import load_dotenv
+import io
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -26,33 +27,35 @@ async def on_ready():
     print(f"{client.user} connecté et prêt!")
 
 
-class ExportCSVView(View):
-    def __init__(self, csv_path):
+class ExportMatchCSVView(View):
+    def __init__(self, df):
         super().__init__(timeout=None)
-        self.csv_path = csv_path
+        self.df = df
 
-    @discord.ui.button(label="📤 Exporter en CSV", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="📤 Télécharger ce match en CSV", style=discord.ButtonStyle.primary
+    )
     async def export_csv(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        user = interaction.user
         try:
-            if not os.path.exists(self.csv_path):
-                await interaction.response.send_message(
-                    "⚠️ Aucun fichier CSV trouvé.", ephemeral=True
-                )
-                return
+            # Créer un fichier CSV en mémoire
+            csv_buffer = io.StringIO()
+            self.df.to_csv(csv_buffer, index=False)
+            csv_buffer.seek(0)
+
+            # Créer un fichier Discord à partir du buffer
+            csv_file = discord.File(
+                fp=io.BytesIO(csv_buffer.getvalue().encode("utf-8")),
+                filename=f"match_stats.csv",
+            )
 
             await interaction.response.send_message(
-                "📩 Envoi du CSV en message privé...", ephemeral=True
+                "📊 Voici les statistiques de ce match :", file=csv_file, ephemeral=True
             )
-            await user.send(
-                "Voici le CSV complet avec toutes les statistiques :",
-                file=discord.File(self.csv_path),
-            )
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "❌ Impossible d'envoyer un DM. Active tes messages privés pour ce serveur.",
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Erreur lors de l'export : {str(e)}",
                 ephemeral=True,
             )
 
@@ -84,11 +87,7 @@ async def on_message(message):
                 df = main(file_path)
 
                 if df is not None and not df.empty:
-                    team1_name = df["team1_name"].iloc[0]
-                    team2_name = df["team2_name"].iloc[0]
-                    team1_score = df["team1_score"].iloc[0]
-                    team2_score = df["team2_score"].iloc[0]
-
+                    # Sauvegarder dans le CSV global
                     df.to_csv(
                         CSV_PATH,
                         mode="a",
@@ -96,10 +95,16 @@ async def on_message(message):
                         header=not os.path.exists(CSV_PATH),
                     )
 
-                    view = ExportCSVView(CSV_PATH)
+                    # Formatter le DataFrame pour l'affichage
+                    df_display = df.to_string(index=False)
+
+                    # Envoyer le DataFrame formaté
+                    await message.channel.send(f"```\n{df_display}\n```")
+
+                    # Envoyer le bouton d'export en dessous
+                    view = ExportMatchCSVView(df)
                     await message.channel.send(
-                        f"Score du match : **{team1_name} {team1_score} - {team2_score} {team2_name}**",
-                        view=view,
+                        "📥 Télécharge les stats de ce match :", view=view
                     )
 
 
